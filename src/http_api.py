@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
 
-from .domain import Actor, DomainError, PermissionDenied, ValidationError
+from .domain import Actor, DomainError, NotFound, PermissionDenied, ValidationError
 
 
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+FAMILY_RE = re.compile(r"^/api/records/(\d+)/family$")
+FAMILY_MEMBER_RE = re.compile(r"^/api/records/(\d+)/family/(\d+)/(remove|documents)$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -27,6 +29,12 @@ def make_handler(service: Any, static_dir: Path):
             if not user_id or not role:
                 raise PermissionDenied("缺少X-User-Id或X-Role")
             return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
+
+        def _family(self) -> Any:
+            family = getattr(service, "family", None)
+            if family is None:
+                raise NotFound("家属台账服务未启用")
+            return family
 
         def _body(self) -> Dict[str, Any]:
             try:
@@ -84,6 +92,12 @@ def make_handler(service: Any, static_dir: Path):
                 if match:
                     self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
                     return
+                match = FAMILY_RE.match(parsed.path)
+                if match:
+                    query = parse_qs(parsed.query)
+                    as_of = query.get("as_of", [None])[0]
+                    self._send(200, self._family().ledger(self._actor(), int(match.group(1)), as_of=as_of))
+                    return
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
@@ -106,6 +120,20 @@ def make_handler(service: Any, static_dir: Path):
                         raise ValidationError("expected_version必须是整数")
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
+                    return
+                match = FAMILY_RE.match(parsed.path)
+                if match:
+                    member = self._family().add_member(self._actor(), int(match.group(1)), body)
+                    self._send(201, member)
+                    return
+                match = FAMILY_MEMBER_RE.match(parsed.path)
+                if match:
+                    record_id, member_id, operation = int(match.group(1)), int(match.group(2)), match.group(3)
+                    if operation == "remove":
+                        result = self._family().remove_member(self._actor(), record_id, member_id, body)
+                    else:
+                        result = self._family().add_documents(self._actor(), record_id, member_id, body)
+                    self._send(200, result)
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:

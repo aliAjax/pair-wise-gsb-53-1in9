@@ -8,10 +8,11 @@ from .rules import DomainRules
 
 
 class Service:
-    def __init__(self, repository: Repository, rules: DomainRules, audit: AuditRecorder = None) -> None:
+    def __init__(self, repository: Repository, rules: DomainRules, audit: AuditRecorder = None, family: Any = None) -> None:
         self.repository = repository
         self.rules = rules
         self.audit = audit or AuditRecorder(repository)
+        self.family = family
 
     @staticmethod
     def _actor(actor: Actor) -> Actor:
@@ -29,9 +30,16 @@ class Service:
         if not self.rules.role_can_create(actor.role):
             raise PermissionDenied("角色无权创建记录")
         reference = text({"reference": reference}, "reference")
-        prepared = self.rules.prepare_create(payload or {})
+        raw = dict(payload or {})
+        family_members = []
+        if self.family is not None:
+            family_members = self.family.validate_new_members(raw.pop("family_members", None))
+        prepared = self.rules.prepare_create(raw)
         self.rules.check_create_conflicts(prepared, self.repository.list_records(limit=500))
-        return self.repository.create(reference, self.rules.INITIAL_STATE, prepared, actor.user_id)
+        record = self.repository.create(reference, self.rules.INITIAL_STATE, prepared, actor.user_id)
+        for member in family_members:
+            self.family.add_member(actor, record["id"], member)
+        return record
 
     def list_records(self, actor: Actor, state: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         actor = self._actor(actor)
@@ -41,7 +49,11 @@ class Service:
     def get_record(self, actor: Actor, record_id: int) -> Dict[str, Any]:
         actor = self._actor(actor)
         self._ensure_known_role(actor)
-        return self.repository.get(record_id)
+        record = self.repository.get(record_id)
+        if self.family is not None:
+            record = dict(record)
+            record["family"] = self.family.ledger(actor, record_id)
+        return record
 
     def act(self, actor: Actor, record_id: int, expected_version: int, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._actor(actor)
@@ -51,6 +63,8 @@ class Service:
             raise PermissionDenied("角色无权执行该操作")
         record = self.repository.get(record_id)
         self.rules.require_transition(record, action)
+        if action == "decide" and self.family is not None:
+            self.family.ensure_decision_ready(record_id)
         new_state, new_payload, summary = self.rules.apply_action(record, action, data or {})
         return self.repository.mutate(
             record_id=record_id,

@@ -47,8 +47,41 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS family_members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    relationship TEXT NOT NULL,
+                    birth_date TEXT NOT NULL,
+                    guardianship_declaration INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    added_by TEXT NOT NULL,
+                    added_at TEXT NOT NULL,
+                    removed_by TEXT,
+                    removed_at TEXT,
+                    removed_reason TEXT
+                );
+                CREATE TABLE IF NOT EXISTS family_member_documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    member_id INTEGER NOT NULL REFERENCES family_members(id) ON DELETE CASCADE,
+                    document TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(member_id, document)
+                );
+                CREATE TABLE IF NOT EXISTS family_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    member_id INTEGER,
+                    event TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_family_members_record ON family_members(record_id, status);
+                CREATE INDEX IF NOT EXISTS idx_family_events_record ON family_events(record_id, id);
                 """
             )
 
@@ -130,6 +163,82 @@ class Repository:
         self.get(record_id)
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM audit_events WHERE record_id=? ORDER BY id", (record_id,)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item["details"])
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _member_row(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["guardianship_declaration"] = bool(item["guardianship_declaration"])
+        return item
+
+    def add_family_member(self, record_id: int, member: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO family_members(record_id,name,relationship,birth_date,guardianship_declaration,status,added_by,added_at) VALUES(?,?,?,?,?,?,?,?)",
+                (record_id, member["name"], member["relationship"], member["birth_date"], int(member["guardianship_declaration"]), "active", actor_id, _now()),
+            )
+            row = connection.execute("SELECT * FROM family_members WHERE id=?", (int(cursor.lastrowid),)).fetchone()
+        return self._member_row(row)
+
+    def get_family_member(self, member_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM family_members WHERE id=?", (member_id,)).fetchone()
+        if row is None:
+            raise NotFound("家属不存在")
+        return self._member_row(row)
+
+    def list_family_members(self, record_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM family_members WHERE record_id=? ORDER BY id", (record_id,)).fetchall()
+        return [self._member_row(row) for row in rows]
+
+    def set_family_member_removed(self, member_id: int, actor_id: str, reason: str) -> Dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE family_members SET status='removed',removed_by=?,removed_at=?,removed_reason=? WHERE id=?",
+                (actor_id, _now(), reason, member_id),
+            )
+            row = connection.execute("SELECT * FROM family_members WHERE id=?", (member_id,)).fetchone()
+        return self._member_row(row)
+
+    def add_family_documents(self, member_id: int, documents: List[str], actor_id: str) -> List[str]:
+        added = []
+        with self._connect() as connection:
+            for document in documents:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO family_member_documents(member_id,document,actor_id,created_at) VALUES(?,?,?,?)",
+                    (member_id, document, actor_id, _now()),
+                )
+                if cursor.rowcount:
+                    added.append(document)
+        return added
+
+    def list_family_documents(self, record_id: int) -> Dict[int, List[str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT d.member_id, d.document FROM family_member_documents d JOIN family_members m ON m.id=d.member_id WHERE m.record_id=? ORDER BY d.id",
+                (record_id,),
+            ).fetchall()
+        result: Dict[int, List[str]] = {}
+        for row in rows:
+            result.setdefault(int(row["member_id"]), []).append(str(row["document"]))
+        return result
+
+    def add_family_event(self, record_id: int, member_id: Optional[int], event: str, actor_id: str, details: Dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO family_events(record_id,member_id,event,actor_id,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, member_id, event, actor_id, json.dumps(details, ensure_ascii=False, sort_keys=True), _now()),
+            )
+
+    def list_family_events(self, record_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM family_events WHERE record_id=? ORDER BY id", (record_id,)).fetchall()
         result = []
         for row in rows:
             item = dict(row)

@@ -5,29 +5,218 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>移民案件期限与材料管理</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
-    button { padding: .55rem .9rem; cursor: pointer; }
-    pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 1.5rem; color: #17212b; }
+    main { max-width: 1080px; margin: auto; }
+    button { padding: .45rem .8rem; cursor: pointer; }
+    input, select, textarea { padding: .35rem; font: inherit; }
+    table { border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; }
+    th, td { border: 1px solid #d5dde5; padding: .4rem .55rem; text-align: left; font-size: .92rem; }
+    th { background: #f0f4f8; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .5rem 0; }
+    .card { border: 1px solid #d5dde5; border-radius: 8px; padding: .8rem 1rem; margin: .8rem 0; }
+    .pending { background: #fff8e6; border-color: #ecd27a; }
+    .muted { color: #6b7785; font-size: .85rem; }
+    .ok { color: #1a7f37; }
+    .warn { color: #b35900; }
+    .withdrawn { color: #8a94a0; text-decoration: line-through; }
+    pre { background: #f4f6f8; padding: .8rem; overflow: auto; border-radius: 8px; font-size: .82rem; }
+    #records button { margin-right: .4rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>移民案件期限与材料管理</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
-  <pre id="output">点击上方按钮读取服务状态。</pre>
+  <p class="muted">演示页使用 admin 身份调用接口。随行家属台账：收案登记关系与出生日期，名单变动后按当前人员重算材料，缺项留在待补区，决定前逐人核对。</p>
+
+  <div class="card">
+    <b>收案登记</b>
+    <div class="row">
+      <input id="c-ref" placeholder="编号 如 IMM-10001" size="14">
+      <input id="c-applicant" placeholder="主申请人ID" size="12">
+      <input id="c-received" placeholder="收案日" size="6" value="100">
+      <input id="c-docs" placeholder="主申请人材料(逗号分隔)" size="24" value="passport,sponsor_letter">
+      <button id="c-create">创建案件</button>
+    </div>
+    <div class="row">
+      <textarea id="c-members" rows="2" style="width:100%" placeholder='随行家属JSON，如 [{"name":"王小明","relationship":"child","birth_day":50}]（关系：spouse/child/parent/sibling/other，出生日期为日偏移，未成年子女自动要求监护声明）'></textarea>
+    </div>
+  </div>
+
+  <div class="row">
+    <button id="load">加载案件列表</button>
+    <span id="msg" class="muted"></span>
+  </div>
+  <div id="records"></div>
+  <div id="detail"></div>
 </main>
 <script>
 const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
-  const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+const REL = {main_applicant:"主申请人", spouse:"配偶", child:"子女", parent:"父母", sibling:"兄弟姐妹", other:"其他亲属"};
+const DOC = {identity_document:"身份材料", guardianship_statement:"监护声明"};
+const CHANGE = {member_registered:"收案登记", member_added:"新增", member_withdrawn:"退出", member_adult:"成年"};
+let current = null;
+
+function docLabel(d){ return DOC[d] || d; }
+function say(t, bad){ const el = document.getElementById("msg"); el.textContent = t; el.style.color = bad ? "#b00020" : "#1a7f37"; }
+
+async function api(path, opts){
+  const res = await fetch(path, Object.assign({headers}, opts || {}));
+  const data = await res.json().catch(() => ({}));
+  if(!res.ok) throw new Error(data.message || ("HTTP " + res.status));
+  return data;
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+async function act(id, version, action, data){
+  return api(`/api/records/${id}/actions/${action}`, {method:"POST", headers:Object.assign({"Content-Type":"application/json"}, headers), body:JSON.stringify({expected_version:version, data:data||{}})});
+}
+
+async function loadRecords(){
+  const data = await api("/api/records?limit=20");
+  const box = document.getElementById("records");
+  box.innerHTML = "<h3>案件列表</h3>" + data.items.map(r =>
+    `<button onclick="openDetail(${r.id})">#${r.id} ${r.reference}｜${r.state}｜${r.payload.applicant_id}</button>`
+  ).join("") || "暂无案件";
+}
+
+async function openDetail(id){
+  try{
+    current = await api("/api/records/" + id);
+    renderDetail();
+    say("已重新加载案件 #" + id + "（重开核对）");
+  }catch(e){ say(e.message, true); }
+}
+
+function renderDetail(){
+  const r = current, p = r.payload, summary = p.document_summary || {people:[], pending_documents:[]};
+  const peopleRows = summary.people.map(person => {
+    const withdrawn = person.status === "withdrawn";
+    const cls = withdrawn ? "withdrawn" : "";
+    const missing = person.missing_documents.map(docLabel).join("、");
+    const submitted = person.submitted_documents.map(docLabel).join("、") || "—";
+    const age = person.birth_day === null || person.birth_day === undefined ? "—" : (person.adult ? "成年" : "未成年");
+    const ops = withdrawn ? `<span class="muted">已退出（第${person.withdrawn_day}天，${person.withdraw_reason || "未说明"}）</span>`
+      : `<button onclick="attachDoc('${person.id}')">挂材料</button>
+         <button onclick="verify('${person.id}')">核对</button>
+         ${person.id === "P0" ? "" : `<button onclick="withdraw('${person.id}')">退出</button>`}`;
+    return `<tr class="${cls}">
+      <td>${person.id}</td><td>${person.name}</td><td>${REL[person.relationship] || person.relationship}</td>
+      <td>${age}</td>
+      <td>${person.required_documents.map(docLabel).join("、") || "—"}</td>
+      <td>${submitted}</td>
+      <td>${missing ? `<span class="warn">${missing}</span>` : '<span class="ok">无</span>'}</td>
+      <td>${person.verified ? '<span class="ok">已核对</span>' : '<span class="muted">未核对</span>'}</td>
+      <td>${ops}</td></tr>`;
+  }).join("");
+
+  const pending = summary.pending_documents.length
+    ? `<ul>${summary.pending_documents.map(i => `<li>${i.person_name || i.person_id}（${REL[i.relationship] || i.relationship}）：${i.document_label || docLabel(i.document)}</li>`).join("")}</ul>`
+    : '<p class="ok">待补区为空，当前在册人员材料齐全。</p>';
+
+  const changes = (p.roster_changes || []).map(c => `<li>第${c.day}天｜${CHANGE[c.type] || c.type}｜${c.detail}</li>`).join("") || "<li>暂无变动</li>";
+
+  document.getElementById("detail").innerHTML = `
+    <div class="card">
+      <h3>案件 #${r.id} ${r.reference} <span class="muted">状态 ${r.state}｜版本 ${r.version}</span></h3>
+      <div class="row">
+        <button onclick="openDetail(${r.id})">重开核对</button>
+        <button onclick="submitCase()">提交申请</button>
+        <button onclick="decideCase()">作出决定</button>
+        <button onclick="loadAudit(${r.id})">审计时间线</button>
+      </div>
+      <h4>随行名单（含退出者历史）</h4>
+      <table><tr><th>编号</th><th>姓名</th><th>关系</th><th>年龄</th><th>要求材料</th><th>名下材料</th><th>缺项</th><th>核对</th><th>操作</th></tr>${peopleRows}</table>
+      <div class="row">
+        <input id="m-name" placeholder="姓名" size="8">
+        <select id="m-rel"><option value="spouse">配偶</option><option value="child">子女</option><option value="parent">父母</option><option value="sibling">兄弟姐妹</option><option value="other">其他亲属</option></select>
+        <input id="m-birth" placeholder="出生日(日偏移)" size="10">
+        <input id="m-day" placeholder="当前日" size="6">
+        <button onclick="addMember()">新增家属</button>
+      </div>
+    </div>
+    <div class="card pending"><b>待补区（按当前名单重算）</b>${pending}</div>
+    <div class="card"><b>名单变动记录</b><ul>${changes}</ul></div>
+    <pre id="audit" style="display:none"></pre>`;
+}
+
+async function run(fn){ try{ await fn(); }catch(e){ say(e.message, true); } }
+function refresh(record){ current = record; renderDetail(); }
+
+async function addMember(){
+  run(async () => {
+    const day = document.getElementById("m-day").value;
+    const data = {name: document.getElementById("m-name").value, relationship: document.getElementById("m-rel").value,
+      birth_day: parseInt(document.getElementById("m-birth").value, 10)};
+    if(day) data.current_day = parseInt(day, 10);
+    refresh(await act(current.id, current.version, "add_member", data));
+    say("家属已登记，材料已按当前名单重算");
+  });
+}
+async function withdraw(personId){
+  run(async () => {
+    const reason = prompt("退出原因", "不随行") || "";
+    const day = prompt("当前日（日偏移）", "");
+    const data = {member_id: personId, reason};
+    if(day) data.current_day = parseInt(day, 10);
+    refresh(await act(current.id, current.version, "withdraw_member", data));
+    say("已退出名单，历史保留");
+  });
+}
+async function attachDoc(personId){
+  run(async () => {
+    const docs = prompt("材料名称（逗号分隔，如 identity_document,guardianship_statement）", "identity_document");
+    if(!docs) return;
+    refresh(await act(current.id, current.version, "attach_document", {person_id: personId, documents: docs.split(",").map(s => s.trim()).filter(Boolean)}));
+    say("材料已挂到 " + personId + " 名下");
+  });
+}
+async function verify(personId){
+  run(async () => { refresh(await act(current.id, current.version, "verify_person", {person_id: personId})); say(personId + " 核对完成"); });
+}
+async function submitCase(){
+  run(async () => {
+    const docs = prompt("提交材料（逗号分隔）", "passport,sponsor_letter");
+    if(!docs) return;
+    refresh(await act(current.id, current.version, "submit", {documents: docs.split(",").map(s => s.trim()).filter(Boolean)}));
+    say("申请已提交");
+  });
+}
+async function decideCase(){
+  run(async () => {
+    const decision = prompt("决定 granted/denied/withdrawn", "granted");
+    if(!decision) return;
+    refresh(await act(current.id, current.version, "decide", {decision, decision_reason: "演示决定"}));
+    say("决定已作出");
+  });
+}
+async function loadAudit(id){
+  run(async () => {
+    const data = await api(`/api/records/${id}/audit`);
+    const el = document.getElementById("audit");
+    el.style.display = "block";
+    el.textContent = JSON.stringify(data.items, null, 2);
+  });
+}
+
+document.getElementById("load").onclick = () => run(loadRecords);
+document.getElementById("c-create").onclick = () => run(async () => {
+  let members = [];
+  const raw = document.getElementById("c-members").value.trim();
+  if(raw) members = JSON.parse(raw);
+  const record = await api("/api/records", {method:"POST", headers:Object.assign({"Content-Type":"application/json"}, headers), body:JSON.stringify({
+    reference: document.getElementById("c-ref").value,
+    data: {
+      applicant_id: document.getElementById("c-applicant").value,
+      case_type: "family",
+      received_day: parseInt(document.getElementById("c-received").value, 10),
+      deadline_days: 30,
+      response_day: parseInt(document.getElementById("c-received").value, 10),
+      representation_active: true,
+      required_documents: document.getElementById("c-docs").value.split(",").map(s => s.trim()).filter(Boolean),
+      members
+    }})});
+  say("案件已创建 #" + record.id);
+  await loadRecords();
+  await openDetail(record.id);
+});
 </script>
 </body>
 </html>

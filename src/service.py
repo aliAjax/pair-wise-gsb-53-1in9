@@ -2,6 +2,7 @@
 from typing import Any, Dict, List, Optional
 
 from .audit import AuditRecorder
+from . import documents
 from .domain import Actor, PermissionDenied, text
 from .repository import Repository
 from .rules import DomainRules
@@ -41,7 +42,14 @@ class Service:
     def get_record(self, actor: Actor, record_id: int) -> Dict[str, Any]:
         actor = self._actor(actor)
         self._ensure_known_role(actor)
-        return self.repository.get(record_id)
+        record = self.repository.get(record_id)
+        payload = record.get("payload") or {}
+        if "document_summary" not in payload:
+            # 旧数据兼容：按当前名单即时补算材料视图（不改变存储）
+            payload.setdefault("members", [])
+            payload.setdefault("roster_changes", [])
+            documents.recompute(payload)
+        return record
 
     def act(self, actor: Actor, record_id: int, expected_version: int, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._actor(actor)
